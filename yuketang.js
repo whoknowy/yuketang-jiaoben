@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂刷课助手
 // @namespace    http://tampermonkey.net/
-// @version      3.0.2
+// @version      3.0.3
 // @description  针对雨课堂视频进行自动播放，配置AI自动答题
 // @author       风之子
 // @license      GPL3
@@ -15,6 +15,8 @@
 // @connect      api.moonshot.cn
 // @connect      api.deepseek.com
 // @connect      dashscope.aliyuncs.com
+// @connect      api.anthropic.com
+// @connect      *
 // @connect      cdn.jsdelivr.net
 // @connect      unpkg.com
 // @require      https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js
@@ -129,6 +131,8 @@
         url: saved.url ?? "https://api.deepseek.com/chat/completions",
         key: saved.key ?? "sk-xxxxxxx",
         model: saved.model ?? "deepseek-chat",
+        apiFormat: saved.apiFormat ?? "openai", // openai 或 anthropic
+        authMethod: saved.authMethod ?? "bearer", // bearer 或 x-api-key
       };
       localStorage.setItem(Config.storageKeys.ai, JSON.stringify(conf));
       return conf;
@@ -399,7 +403,7 @@
               <div class="body">
                 <ul class="info" id="info">
                   <li>⭐ 脚本支持：雨课堂所有版本</li>
-                  <li>🤖 <strong>支持模型：</strong>DeepSeek、Kimi(Moonshot)、通义千问、OpenAI</li>
+                  <li>🤖 <strong>支持模型：</strong>DeepSeek、Kimi(Moonshot)、通义千问、OpenAI、Claude(Anthropic)</li>
                   <li>📢 <strong>使用必读：</strong>自动答题需先点击<span style="color:green">[AI配置]</span>开启并填入API Key</li>
                   <li>🚀 配置完成后，点击<span style="color:blue">[开始刷课]</span>即可启动视频与作业挂机</li>
                   <li>🤝 脚本还有很多不足，欢迎各位一起完善代码</li>
@@ -418,6 +422,20 @@
                 <div class="form-item">
                   <label>Model Name:</label>
                   <input type="text" id="ai_model" placeholder="deepseek-chat">
+                </div>
+                <div class="form-item">
+                  <label>API Format:</label>
+                  <select id="ai_format" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:12px;">
+                    <option value="openai">OpenAI Format (Chat Completions)</option>
+                    <option value="anthropic">Anthropic Format (Messages API)</option>
+                  </select>
+                </div>
+                <div class="form-item">
+                  <label>Auth Method:</label>
+                  <select id="auth_method" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:12px;">
+                    <option value="bearer">Bearer Token (Authorization: Bearer)</option>
+                    <option value="x-api-key">X-API-Key Header</option>
+                  </select>
                 </div>
                 <div class="form-item">
                   <label class="checkbox-label">
@@ -460,6 +478,8 @@
       aiUrlInput: doc.getElementById('ai_url'),
       aiKeyInput: doc.getElementById('ai_key'),
       aiModelInput: doc.getElementById('ai_model'),
+      aiFormatSelect: doc.getElementById('ai_format'),
+      authMethodSelect: doc.getElementById('auth_method'),
       featureAutoAI: doc.getElementById('feature_auto_ai'),
       featureAutoComment: doc.getElementById('feature_auto_comment'),
       minimality: doc.getElementById('minimality'),
@@ -534,12 +554,14 @@
       if (ui.info.lastElementChild) ui.info.lastElementChild.scrollIntoView({ behavior: 'smooth', block: 'end', inline: 'nearest' });
     };
 
-    const defaultAI = { url: 'https://api.deepseek.com/chat/completions', key: 'sk-xxxxxxx', model: 'deepseek-chat' };
+    const defaultAI = { url: 'https://api.deepseek.com/chat/completions', key: 'sk-xxxxxxx', model: 'deepseek-chat', apiFormat: 'openai', authMethod: 'bearer' };
     const loadAIConf = () => {
       const saved = Store.getAIConf();
       ui.aiUrlInput.value = saved.url || defaultAI.url;
       ui.aiKeyInput.value = saved.key || defaultAI.key;
       ui.aiModelInput.value = saved.model || defaultAI.model;
+      ui.aiFormatSelect.value = saved.apiFormat || defaultAI.apiFormat;
+      ui.authMethodSelect.value = saved.authMethod || defaultAI.authMethod;
     };
     const loadFeatureConf = () => {
       const saved = Store.getFeatureConf();
@@ -560,7 +582,9 @@
       const conf = {
         url: ui.aiUrlInput.value.trim(),
         key: ui.aiKeyInput.value.trim(),
-        model: ui.aiModelInput.value.trim()
+        model: ui.aiModelInput.value.trim(),
+        apiFormat: ui.aiFormatSelect.value,
+        authMethod: ui.authMethodSelect.value
       };
       Store.setAIConf(conf);
       const featureConf = {
@@ -720,6 +744,8 @@
       const API_URL = saved.url;
       const API_KEY = saved.key;
       const MODEL_NAME = saved.model;
+      const API_FORMAT = saved.apiFormat || 'openai';
+      const AUTH_METHOD = saved.authMethod || 'bearer';
       return new Promise((resolve, reject) => {
         if (!API_KEY || API_KEY.includes('sk-xxxx')) {
           const msg = '⚠️ 请在 [AI配置] 中填写有效的 API Key';
@@ -738,40 +764,108 @@
 题目内容：
 ${ocrText}
 `;
-        GM_xmlhttpRequest({
-          method: 'POST',
-          url: API_URL,
-          headers: {
+        const systemPrompt = "你是一个只输出答案的助手。判断题输出'对'或'错'，选择题输出字母。";
+
+        // 构建认证 header
+        const authHeader = AUTH_METHOD === 'x-api-key'
+          ? { 'x-api-key': API_KEY }
+          : { 'Authorization': `Bearer ${API_KEY}` };
+
+        if (API_FORMAT === 'anthropic') {
+          // Anthropic API 格式
+          const headers = {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${API_KEY}`
-          },
-          data: JSON.stringify({
+            ...authHeader
+          };
+          // 只有原生 Anthropic API 才需要 anthropic-version，代理通常不需要
+          if (API_URL.includes('api.anthropic.com')) {
+            headers['anthropic-version'] = '2023-06-01';
+          }
+          const requestBody = {
             model: MODEL_NAME,
+            max_tokens: 1024,
+            system: systemPrompt,
             messages: [
-              { role: 'system', content: "你是一个只输出答案的助手。判断题输出'对'或'错'，选择题输出字母。" },
               { role: 'user', content: prompt }
-            ],
-            temperature: 0.1
-          }),
-          timeout: 15000,
-          onload: res => {
-            if (res.status === 200) {
-              try {
-                const json = JSON.parse(res.responseText);
-                const answerText = json.choices[0].message.content;
-                resolve(answerText);
-              } catch (e) {
-                reject('JSON 解析失败');
+            ]
+          };
+          // 调试日志
+          console.log('[AI请求] URL:', API_URL);
+          console.log('[AI请求] Headers:', headers);
+          console.log('[AI请求] Body:', requestBody);
+          panel.log(`请求 ${API_URL}...`);
+          GM_xmlhttpRequest({
+            method: 'POST',
+            url: API_URL,
+            headers,
+            data: JSON.stringify(requestBody),
+            data: JSON.stringify({
+              model: MODEL_NAME,
+              max_tokens: 1024,
+              system: systemPrompt,
+              messages: [
+                { role: 'user', content: prompt }
+              ]
+            }),
+            timeout: 120000, // 120秒，思考模型需要更长响应时间
+            onload: res => {
+              console.log('[AI响应] Status:', res.status);
+              console.log('[AI响应] Response:', res.responseText);
+              if (res.status === 200) {
+                try {
+                  const json = JSON.parse(res.responseText);
+                  // Anthropic 返回格式: content[0].text
+                  const answerText = json.content?.[0]?.text || json.choices?.[0]?.message?.content;
+                  resolve(answerText);
+                } catch (e) {
+                  reject('JSON 解析失败');
+                }
+              } else {
+                const err = `请求失败: HTTP ${res.status} - ${res.responseText}`;
+                panel.log(err);
+                reject(err);
               }
-            } else {
-              const err = `请求失败: HTTP ${res.status}`;
-              panel.log(err);
-              reject(err);
-            }
-          },
-          onerror: () => reject('网络错误'),
-          ontimeout: () => reject('请求超时')
-        });
+            },
+            onerror: () => reject('网络错误'),
+            ontimeout: () => reject('请求超时')
+          });
+        } else {
+          // OpenAI API 格式（默认）
+          GM_xmlhttpRequest({
+            method: 'POST',
+            url: API_URL,
+            headers: {
+              'Content-Type': 'application/json',
+              ...authHeader
+            },
+            data: JSON.stringify({
+              model: MODEL_NAME,
+              messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: prompt }
+              ],
+              temperature: 0.1
+            }),
+            timeout: 120000, // 120秒，思考模型需要更长响应时间
+            onload: res => {
+              if (res.status === 200) {
+                try {
+                  const json = JSON.parse(res.responseText);
+                  const answerText = json.choices[0].message.content;
+                  resolve(answerText);
+                } catch (e) {
+                  reject('JSON 解析失败');
+                }
+              } else {
+                const err = `请求失败: HTTP ${res.status}`;
+                panel.log(err);
+                reject(err);
+              }
+            },
+            onerror: () => reject('网络错误'),
+            ontimeout: () => reject('请求超时')
+          });
+        }
       });
     },
     async autoSelectAndSubmit(aiResponse, itemBodyElement) {
@@ -1119,6 +1213,7 @@ ${ocrText}
       item.click();
       await Utils.sleep(1500);
       let i = 0;
+      const maxRetry = 3; // 最大重试次数
       while (true) {
         const items = document.querySelectorAll('.subject-item.J_order');
         if (i >= items.length) {
@@ -1143,12 +1238,27 @@ ${ocrText}
         if (listContainer) optionCount = listContainer.querySelectorAll('li').length;
         const ocrResult = await Solver.recognize(targetEl);
         if (ocrResult && ocrResult.length > 5) {
-          try {
-            panel.log('🤖 请求 AI 获取答案...');
-            const aiText = await Solver.askAI(ocrResult, optionCount);
-            await Solver.autoSelectAndSubmit(aiText, targetEl);
-          } catch (err) {
-            this.panel.log(`AI 答题失败：${err}`);
+          let retryCount = 0;
+          let success = false;
+          while (retryCount < maxRetry && !success) {
+            try {
+              if (retryCount > 0) {
+                this.panel.log(`🔄 第 ${i + 1} 题重试 ${retryCount}/${maxRetry}...`);
+              }
+              panel.log('🤖 请求 AI 获取答案...');
+              const aiText = await Solver.askAI(ocrResult, optionCount);
+              await Solver.autoSelectAndSubmit(aiText, targetEl);
+              success = true;
+            } catch (err) {
+              retryCount++;
+              this.panel.log(`AI 答题失败：${err}`);
+              if (retryCount < maxRetry) {
+                this.panel.log(`等待 5 秒后重试...`);
+                await Utils.sleep(5000);
+              } else {
+                this.panel.log(`⚠️ 第 ${i + 1} 题重试 ${maxRetry} 次后仍失败，跳过`);
+              }
+            }
           }
         }
         await Utils.sleep(1500);
